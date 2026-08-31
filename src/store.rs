@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use aws_config::retry::RetryConfig;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use reqwest::{StatusCode, blocking::Client as HttpClient};
@@ -92,7 +93,7 @@ impl ObjectStore for HttpStore {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct S3Options {
     pub bucket: String,
     pub prefix: String,
@@ -104,6 +105,27 @@ pub struct S3Options {
     pub session_token: Option<String>,
     pub anonymous: bool,
     pub force_path_style: bool,
+    pub retry_max_attempts: u32,
+    pub retry_max_backoff_ms: u64,
+}
+
+impl Default for S3Options {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            prefix: String::new(),
+            endpoint: None,
+            region: None,
+            profile: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            anonymous: false,
+            force_path_style: false,
+            retry_max_attempts: 4,
+            retry_max_backoff_ms: 5_000,
+        }
+    }
 }
 
 pub struct S3Store {
@@ -124,9 +146,23 @@ impl S3Store {
             !options.anonymous || options.access_key_id.is_none(),
             "S3 anonymous mode cannot be combined with explicit credentials"
         );
+        ensure!(
+            (1..=10).contains(&options.retry_max_attempts),
+            "S3 retry_max_attempts must be between 1 and 10"
+        );
+        ensure!(
+            options.retry_max_backoff_ms > 0,
+            "S3 retry_max_backoff_ms must be greater than zero"
+        );
         let runtime = tokio::runtime::Runtime::new()?;
         let shared = runtime.block_on(async {
-            let mut loader = aws_config::from_env();
+            let retry_config = RetryConfig::standard()
+                .with_max_attempts(options.retry_max_attempts)
+                .with_initial_backoff(std::time::Duration::from_millis(100))
+                .with_max_backoff(std::time::Duration::from_millis(
+                    options.retry_max_backoff_ms,
+                ));
+            let mut loader = aws_config::from_env().retry_config(retry_config);
             if let Some(region) = options.region.clone() {
                 loader = loader.region(aws_config::Region::new(region));
             }

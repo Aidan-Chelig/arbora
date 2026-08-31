@@ -183,6 +183,10 @@ prefix = "arbora/my-project"
 # Optional authentication controls:
 # profile = "publisher"
 # anonymous = true
+
+# Bounded retries for transient failures such as R2 HTTP 503 responses:
+# retry_max_attempts = 4
+# retry_max_backoff_ms = 5000
 ```
 
 By default, Arbora uses the standard AWS credential chain, including:
@@ -198,6 +202,12 @@ are strongly preferred so credentials are not committed to Git.
 
 Set `anonymous = true` for unsigned access to a public bucket. Anonymous mode
 cannot be combined with explicit credentials.
+
+S3 requests use jittered exponential backoff for transient errors, including
+Cloudflare R2 HTTP 503 `ServiceUnavailable` responses. The default is four
+total attempts (the initial request and up to three retries), with a five-second
+maximum delay between attempts. `retry_max_attempts` accepts values from 1
+(retries disabled) through 10, so retries always remain bounded.
 
 Recommended permissions are:
 

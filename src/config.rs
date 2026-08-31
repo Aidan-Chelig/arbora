@@ -36,6 +36,10 @@ pub struct Remote {
     pub anonymous: bool,
     #[serde(default)]
     pub force_path_style: bool,
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Workspace {
@@ -54,6 +58,12 @@ pub struct Lock {
 }
 fn default_remove_stale() -> bool {
     true
+}
+fn default_retry_max_attempts() -> u32 {
+    4
+}
+fn default_retry_max_backoff_ms() -> u64 {
+    5_000
 }
 
 impl Config {

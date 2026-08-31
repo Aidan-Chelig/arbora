@@ -114,6 +114,8 @@ fn stores(project: &Path) -> Result<(Config, Box<dyn ObjectStore>, LocalStore)> 
             session_token: c.remote.session_token.clone(),
             anonymous: c.remote.anonymous,
             force_path_style: c.remote.force_path_style,
+            retry_max_attempts: c.remote.retry_max_attempts,
+            retry_max_backoff_ms: c.remote.retry_max_backoff_ms,
         })?),
         other => bail!("unsupported remote type {other:?}; expected local, http, or s3"),
     };
@@ -144,6 +146,8 @@ fn init(project: &Path, workspace: PathBuf, remote: PathBuf, force: bool) -> Res
             session_token: None,
             anonymous: false,
             force_path_style: false,
+            retry_max_attempts: 4,
+            retry_max_backoff_ms: 5_000,
         },
         workspace: config::Workspace {
             path: workspace.clone(),
