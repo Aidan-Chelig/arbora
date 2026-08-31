@@ -59,6 +59,7 @@ arbora verify
 
 ```text
 .arbora.toml       Project configuration
+.aboraignore        Git-style asset exclusion rules
 assets/            Asset workspace
 .arbora-remote/    Default local object store
 ```
@@ -102,6 +103,28 @@ locked tree.
 
 Use `--project PATH` with any command to operate on a project other than the
 current directory.
+
+## Ignoring files
+
+Place Git-style patterns in `.aboraignore` at the project root. Patterns are
+matched relative to the configured workspace and affect every operation that
+scans local assets, including `status`, `push`, `sync`, `diff`, and `verify`.
+
+```gitignore
+# Temporary exports anywhere in the tree
+*.tmp
+
+# A generated directory
+cache/
+
+# Negation is supported
+!keep.tmp
+```
+
+Comments, anchored paths, directory rules, `**`, and `!` negation follow
+`.gitignore` semantics. Ignored files are neither uploaded nor represented in
+the root hash. A normal pull preserves ignored local files while removing other
+stale paths.
 
 ## Configuration
 

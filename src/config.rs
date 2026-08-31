@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -7,6 +8,7 @@ use std::{
 
 pub const CONFIG: &str = ".arbora.toml";
 pub const LOCK: &str = "assets.lock";
+pub const IGNORE: &str = ".aboraignore";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -71,6 +73,17 @@ impl Config {
         Ok(dirs::cache_dir()
             .context("cannot determine cache directory")?
             .join("arbora"))
+    }
+    pub fn ignore(&self, project: &Path) -> Result<Gitignore> {
+        let path = project.join(IGNORE);
+        let mut builder = GitignoreBuilder::new(self.workspace(project));
+        builder.add_line(None, &format!("/{IGNORE}"))?;
+        if path.exists()
+            && let Some(error) = builder.add(&path)
+        {
+            return Err(error).with_context(|| format!("parse {}", path.display()));
+        }
+        builder.build().map_err(Into::into)
     }
 }
 pub fn read_lock(project: &Path) -> Result<Lock> {

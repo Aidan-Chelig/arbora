@@ -1,5 +1,6 @@
 use crate::store::ObjectStore;
 use anyhow::{Context, Result, bail, ensure};
+use ignore::gitignore::Gitignore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -127,16 +128,29 @@ pub struct ScanStats {
     pub bytes: u64,
 }
 pub fn scan(root: &Path, stores: &[&dyn ObjectStore]) -> Result<(String, ScanStats)> {
+    scan_with_ignore(root, stores, None)
+}
+pub fn scan_with_ignore(
+    root: &Path,
+    stores: &[&dyn ObjectStore],
+    ignore: Option<&Gitignore>,
+) -> Result<(String, ScanStats)> {
     ensure!(
         root.is_dir(),
         "workspace does not exist or is not a directory: {}",
         root.display()
     );
     let mut stats = ScanStats::default();
-    let hash = scan_dir(root, stores, &mut stats)?;
+    let hash = scan_dir(root, root, stores, ignore, &mut stats)?;
     Ok((hash, stats))
 }
-fn scan_dir(dir: &Path, stores: &[&dyn ObjectStore], stats: &mut ScanStats) -> Result<String> {
+fn scan_dir(
+    root: &Path,
+    dir: &Path,
+    stores: &[&dyn ObjectStore],
+    ignore: Option<&Gitignore>,
+    stats: &mut ScanStats,
+) -> Result<String> {
     let mut paths: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
     paths.sort_by_key(|e| e.file_name());
     let mut tree = Tree::new();
@@ -148,10 +162,21 @@ fn scan_dir(dir: &Path, stores: &[&dyn ObjectStore], stats: &mut ScanStats) -> R
         validate_name(&name)?;
         let path = item.path();
         let meta = fs::symlink_metadata(&path)?;
+        if ignore.is_some_and(|matcher| {
+            matcher
+                .matched(path.strip_prefix(root).unwrap_or(&path), meta.is_dir())
+                .is_ignore()
+        }) {
+            continue;
+        }
         let (kind, hash, executable) = if meta.file_type().is_symlink() {
             bail!("symbolic links are not supported: {}", path.display())
         } else if meta.is_dir() {
-            (Kind::Tree, scan_dir(&path, stores, stats)?, false)
+            (
+                Kind::Tree,
+                scan_dir(root, &path, stores, ignore, stats)?,
+                false,
+            )
         } else if meta.is_file() {
             let content = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             stats.bytes += content.len() as u64;

@@ -3,6 +3,7 @@ use crate::{
     store::{LocalStore, ObjectStore},
 };
 use anyhow::Result;
+use ignore::gitignore::Gitignore;
 use std::{collections::BTreeSet, fs, path::Path};
 
 pub fn copy_object(hash: &str, from: &dyn ObjectStore, to: &dyn ObjectStore) -> Result<bool> {
@@ -36,6 +37,7 @@ pub fn materialize(
     workspace: &Path,
     cache: &dyn ObjectStore,
     remove_stale: bool,
+    ignore: Option<&Gitignore>,
 ) -> Result<()> {
     let staging = workspace.with_extension(format!("arbora-staging-{}", std::process::id()));
     if staging.exists() {
@@ -65,6 +67,9 @@ pub fn materialize(
     }
     if workspace.exists() {
         if remove_stale {
+            if let Some(ignore) = ignore {
+                preserve_ignored(workspace, workspace, &staging, ignore)?;
+            }
             let old = workspace.with_extension(format!("arbora-old-{}", std::process::id()));
             if old.exists() {
                 fs::remove_dir_all(&old)?
@@ -83,6 +88,56 @@ pub fn materialize(
         }
     } else {
         fs::rename(staging, workspace)?
+    }
+    Ok(())
+}
+fn preserve_ignored(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    ignore: &Gitignore,
+) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        let relative = source_path.strip_prefix(root)?;
+        if ignore.matched(relative, file_type.is_dir()).is_ignore() {
+            copy_path(&source_path, &destination_path)?;
+        } else if file_type.is_dir() {
+            preserve_ignored(root, &source_path, &destination_path, ignore)?;
+        }
+    }
+    Ok(())
+}
+fn copy_path(source: &Path, destination: &Path) -> Result<()> {
+    if destination.is_dir() {
+        fs::remove_dir_all(destination)?;
+    } else if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    copy_path_inner(source, destination)
+}
+fn copy_path_inner(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "ignored symbolic links cannot be preserved: {}",
+            source.display()
+        );
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_path_inner(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
     }
     Ok(())
 }

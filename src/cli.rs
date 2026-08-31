@@ -152,13 +152,21 @@ fn init(project: &Path, workspace: PathBuf, remote: PathBuf, force: bool) -> Res
         cache: config::Cache::default(),
     };
     fs::write(&path, toml::to_string_pretty(&c)?)?;
+    let ignore = project.join(config::IGNORE);
+    if !ignore.exists() {
+        fs::write(
+            ignore,
+            "# Git-style patterns relative to the asset workspace.\n",
+        )?;
+    }
     fs::create_dir_all(project.join(workspace))?;
     fs::create_dir_all(project.join(remote).join("objects"))?;
     println!("initialized {}", project.display());
     Ok(())
 }
 fn workspace_root(project: &Path, c: &Config, cache: &LocalStore) -> Result<String> {
-    Ok(merkle::scan(&c.workspace(project), &[cache])?.0)
+    let ignore = c.ignore(project)?;
+    Ok(merkle::scan_with_ignore(&c.workspace(project), &[cache], Some(&ignore))?.0)
 }
 fn status(project: &Path) -> Result<()> {
     let (c, _, cache) = stores(project)?;
@@ -174,7 +182,12 @@ fn status(project: &Path) -> Result<()> {
 }
 fn push(project: &Path) -> Result<()> {
     let (c, remote, cache) = stores(project)?;
-    let (root, stats) = merkle::scan(&c.workspace(project), &[&cache, remote.as_ref()])?;
+    let ignore = c.ignore(project)?;
+    let (root, stats) = merkle::scan_with_ignore(
+        &c.workspace(project),
+        &[&cache, remote.as_ref()],
+        Some(&ignore),
+    )?;
     config::write_lock(project, &root)?;
     println!(
         "pushed {root}\n{} blobs, {} trees, {} bytes",
@@ -186,11 +199,13 @@ fn pull(project: &Path, keep_stale: bool) -> Result<()> {
     let (c, remote, cache) = stores(project)?;
     let root = config::read_lock(project)?.root;
     let fetched = cache::fetch_tree(&root, remote.as_ref(), &cache)?;
+    let ignore = c.ignore(project)?;
     cache::materialize(
         &root,
         &c.workspace(project),
         &cache,
         c.workspace.remove_stale && !keep_stale,
+        Some(&ignore),
     )?;
     println!("pulled {root}\n{fetched} objects fetched");
     Ok(())
