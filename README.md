@@ -1,43 +1,128 @@
 # Arbora
 
-Arbora synchronizes asset directories through an immutable, BLAKE3-addressed
-Merkle tree. Git tracks `assets.lock`; file and tree objects live outside Git in
-a local object store and a reusable cache.
+Arbora keeps large asset trees out of Git without giving up reproducibility.
+Files and directories are stored as immutable, BLAKE3-addressed objects; Git
+only needs to track a small `assets.lock` file containing the expected root
+hash.
+
+It is roughly **rsync for content-addressed object storage**.
+
+## Features
+
+- Deterministic Merkle trees with one hash identifying the complete asset state
+- Local filesystem, anonymous read-only HTTP/HTTPS, and S3-compatible remotes
+- AWS Signature V4 and the standard AWS credential provider chain
+- Verified downloads: corrupt objects are rejected before materialization
+- A global cache shared by projects and worktrees
+- File-level status and diffs without a separate revision-history system
+- Executable-bit preservation and atomic workspace replacement on pull
+
+Arbora currently stores each file as one blob. Content-defined chunking and
+remote garbage collection are intentionally out of scope for the initial
+version.
+
+## Installation
+
+Arbora requires Rust 1.98 or newer.
+
+```console
+cargo install --git https://github.com/Aidan-Chelig/arbora
+```
+
+To build from a checkout:
+
+```console
+git clone https://github.com/Aidan-Chelig/arbora.git
+cd arbora
+nix develop             # optional; provides the pinned Rust toolchain
+cargo build --release
+```
+
+The resulting executable is `target/release/arbora`.
 
 ## Quick start
 
 ```console
+cd my-project
 arbora init
-# add files under assets/
+
+# Add files beneath assets/, then publish them.
 arbora push
-arbora status
+git add .arbora.toml assets.lock
+
+# On another checkout:
 arbora pull
 arbora verify
 ```
 
-`arbora init` creates `.arbora.toml`, `assets/`, and a local remote at
-`.arbora-remote/`. Commit `.arbora.toml` and `assets.lock`, but add `assets/` and
-`.arbora-remote/` to `.gitignore`. The default cache is the platform cache
-directory under `arbora/`; set `[cache].path` in `.arbora.toml` to override it.
+`arbora init` creates:
 
-Use `arbora diff` for changes between the locked root and the workspace, or
-`arbora diff ROOT_A ROOT_B` for two stored roots. `arbora sync` pulls a clean
-workspace and pushes a changed workspace; `arbora sync --pull` explicitly
-discards local changes. Pull removes stale files by default. Pass `--keep-stale`
-to merge the locked tree into the workspace instead.
+```text
+.arbora.toml       Project configuration
+assets/            Asset workspace
+.arbora-remote/    Default local object store
+```
 
-## Remote backends
+Commit `.arbora.toml` and `assets.lock`. Usually the following belongs in the
+project's `.gitignore`:
 
-The default local remote uses a path relative to the project:
+```gitignore
+/assets/
+/.arbora-remote/
+```
+
+The default cache is the platform cache directory under `arbora/` (typically
+`~/.cache/arbora` on Linux). It can be overridden in `.arbora.toml`:
+
+```toml
+[cache]
+path = "/fast-disk/arbora-cache"
+```
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `arbora init` | Create the initial configuration and workspace |
+| `arbora status` | Compare the workspace with `assets.lock` |
+| `arbora push` | Upload missing objects and update `assets.lock` |
+| `arbora pull` | Materialize the tree named by `assets.lock` |
+| `arbora sync` | Pull a clean workspace or push a changed workspace |
+| `arbora diff` | Show added, modified, and deleted files |
+| `arbora verify` | Verify the remote object graph and workspace root |
+| `arbora gc` | Remove cache objects not reachable from this lock file |
+
+`arbora diff ROOT_A ROOT_B` compares two stored roots. With no roots it compares
+the locked root to the workspace.
+
+Pull replaces the workspace and removes stale files by default. Use
+`arbora pull --keep-stale` to merge locked files into the existing workspace.
+`arbora sync --pull` explicitly discards local asset changes and restores the
+locked tree.
+
+Use `--project PATH` with any command to operate on a project other than the
+current directory.
+
+## Configuration
+
+### Local filesystem
+
+Local paths are resolved relative to the project:
 
 ```toml
 [remote]
 type = "local"
 path = ".arbora-remote"
+
+[workspace]
+path = "assets"
+remove_stale = true
 ```
 
-HTTP remotes are anonymous and read-only. The URL is the directory above the
-`objects/` layout, and an optional prefix is prepended to every object key:
+### HTTP/HTTPS
+
+HTTP remotes are anonymous and read-only. The URL points to the directory above
+the object layout. An optional prefix is prepended to every object key.
 
 ```toml
 [remote]
@@ -46,8 +131,20 @@ url = "https://cdn.example.com"
 prefix = "my-project"
 ```
 
-S3 remotes support AWS S3 and compatible services such as R2, B2, MinIO,
-Tigris, and Garage:
+Objects are requested using `HEAD` and `GET`, for example:
+
+```text
+https://cdn.example.com/my-project/objects/ab/cdef...
+```
+
+An HTTP remote can be used by `pull`, `diff`, and `verify`. Once the locked tree
+is cached, `status` works without contacting the remote. `push` requires a
+writable local or S3 remote.
+
+### S3-compatible storage
+
+The S3 backend works with AWS S3 and compatible providers such as Cloudflare
+R2, Backblaze B2, MinIO, Tigris, and Garage.
 
 ```toml
 [remote]
@@ -55,16 +152,65 @@ type = "s3"
 bucket = "my-assets"
 region = "us-east-1"
 prefix = "arbora/my-project"
+
+# Common for non-AWS providers:
 # endpoint = "https://custom-s3.example.com"
 # force_path_style = true
+
+# Optional authentication controls:
 # profile = "publisher"
 # anonymous = true
 ```
 
-By default the AWS SDK credential chain checks environment variables (including
-session tokens and `AWS_PROFILE`), shared AWS config/credential files, web
-identity, and container or instance roles. `profile` selects a shared profile.
-For exceptional cases, `access_key_id`, `secret_access_key`, and
-`session_token` can be placed in `[remote]`, but avoid committing secrets;
-environment variables or profiles are preferred. Set `anonymous = true` for a
-public S3 bucket. Custom endpoints commonly also need `force_path_style = true`.
+By default, Arbora uses the standard AWS credential chain, including:
+
+1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`
+2. Shared AWS configuration and credentials files
+3. `AWS_PROFILE` or the configured `profile`
+4. Web identity, container credentials, and instance roles
+
+Explicit `access_key_id`, `secret_access_key`, and `session_token` fields are
+also supported under `[remote]`, but environment variables or shared profiles
+are strongly preferred so credentials are not committed to Git.
+
+Set `anonymous = true` for unsigned access to a public bucket. Anonymous mode
+cannot be combined with explicit credentials.
+
+Recommended permissions are:
+
+- Readers: `GET`, `HEAD`
+- Publishers: `GET`, `HEAD`, `PUT`
+
+Arbora does not need delete permission for normal operation.
+
+## Storage layout
+
+Objects use the same layout on every backend:
+
+```text
+objects/<first two hash characters>/<remaining hash characters>
+```
+
+Blob and tree objects include a type marker in the hashed bytes. Tree entries
+are serialized deterministically in name order and contain the child name,
+object type, hash, and executable flag. Changing one file changes that blob,
+its parent tree, and each ancestor up to the root; unchanged subtrees retain
+their hashes.
+
+Downloaded objects are always hashed again before Arbora trusts them.
+
+## Development
+
+```console
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+nix flake check path:. --no-build
+```
+
+The loopback HTTP integration test is ignored in restricted sandboxes. Run it
+explicitly where local sockets are available:
+
+```console
+cargo test --test http_store -- --ignored
+```
