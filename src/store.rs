@@ -1,0 +1,276 @@
+use anyhow::{Context, Result, bail, ensure};
+use aws_credential_types::Credentials;
+use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
+use reqwest::{StatusCode, blocking::Client as HttpClient};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub trait ObjectStore {
+    fn get(&self, hash: &str) -> Result<Vec<u8>>;
+    fn put(&self, hash: &str, bytes: &[u8]) -> Result<bool>;
+    fn exists(&self, hash: &str) -> Result<bool>;
+}
+
+pub fn object_key(hash: &str, prefix: &str) -> Result<String> {
+    let hex = hash.strip_prefix("blake3:").unwrap_or(hash);
+    ensure!(
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid object hash: {hash}"
+    );
+    let key = format!("objects/{}/{}", &hex[..2], &hex[2..]);
+    Ok(if prefix.trim_matches('/').is_empty() {
+        key
+    } else {
+        format!("{}/{key}", prefix.trim_matches('/'))
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalStore {
+    root: PathBuf,
+}
+
+impl LocalStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn object_path(&self, hash: &str) -> Result<PathBuf> {
+        Ok(self.root.join(object_key(hash, "")?))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpStore {
+    base_url: String,
+    prefix: String,
+    client: HttpClient,
+}
+
+impl HttpStore {
+    pub fn new(base_url: impl Into<String>, prefix: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        ensure!(
+            base_url.starts_with("http://") || base_url.starts_with("https://"),
+            "HTTP remote URL must use http:// or https://"
+        );
+        Ok(Self {
+            base_url,
+            prefix: prefix.into(),
+            client: HttpClient::builder().build()?,
+        })
+    }
+    fn url(&self, hash: &str) -> Result<String> {
+        Ok(format!(
+            "{}/{}",
+            self.base_url,
+            object_key(hash, &self.prefix)?
+        ))
+    }
+}
+
+impl ObjectStore for HttpStore {
+    fn get(&self, hash: &str) -> Result<Vec<u8>> {
+        let url = self.url(hash)?;
+        let response = self.client.get(&url).send()?.error_for_status()?;
+        Ok(response.bytes()?.to_vec())
+    }
+    fn put(&self, _hash: &str, _bytes: &[u8]) -> Result<bool> {
+        bail!("HTTP remotes are read-only; configure a local or S3 remote to push")
+    }
+    fn exists(&self, hash: &str) -> Result<bool> {
+        let response = self.client.head(self.url(hash)?).send()?;
+        match response.status() {
+            status if status.is_success() => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            status => bail!("HTTP HEAD failed with {status}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct S3Options {
+    pub bucket: String,
+    pub prefix: String,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub profile: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub anonymous: bool,
+    pub force_path_style: bool,
+}
+
+pub struct S3Store {
+    client: S3Client,
+    runtime: tokio::runtime::Runtime,
+    bucket: String,
+    prefix: String,
+}
+
+impl S3Store {
+    pub fn new(options: S3Options) -> Result<Self> {
+        ensure!(!options.bucket.is_empty(), "S3 remote requires a bucket");
+        ensure!(
+            options.access_key_id.is_some() == options.secret_access_key.is_some(),
+            "S3 explicit credentials require both access_key_id and secret_access_key"
+        );
+        ensure!(
+            !options.anonymous || options.access_key_id.is_none(),
+            "S3 anonymous mode cannot be combined with explicit credentials"
+        );
+        let runtime = tokio::runtime::Runtime::new()?;
+        let shared = runtime.block_on(async {
+            let mut loader = aws_config::from_env();
+            if let Some(region) = options.region.clone() {
+                loader = loader.region(aws_config::Region::new(region));
+            }
+            if let Some(profile) = options.profile.as_deref() {
+                loader = loader.profile_name(profile);
+            }
+            if options.anonymous {
+                loader = loader.no_credentials();
+            } else if let (Some(access), Some(secret)) = (
+                options.access_key_id.clone(),
+                options.secret_access_key.clone(),
+            ) {
+                loader = loader.credentials_provider(Credentials::new(
+                    access,
+                    secret,
+                    options.session_token.clone(),
+                    None,
+                    "arbora-config",
+                ));
+            }
+            loader.load().await
+        });
+        let mut builder =
+            aws_sdk_s3::config::Builder::from(&shared).force_path_style(options.force_path_style);
+        if let Some(endpoint) = options.endpoint {
+            builder = builder.endpoint_url(endpoint);
+        }
+        if options.anonymous {
+            builder = builder.allow_no_auth();
+        }
+        Ok(Self {
+            client: S3Client::from_conf(builder.build()),
+            runtime,
+            bucket: options.bucket,
+            prefix: options.prefix,
+        })
+    }
+    fn key(&self, hash: &str) -> Result<String> {
+        object_key(hash, &self.prefix)
+    }
+}
+
+impl ObjectStore for S3Store {
+    fn get(&self, hash: &str) -> Result<Vec<u8>> {
+        let key = self.key(hash)?;
+        self.runtime.block_on(async {
+            let output = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .with_context(|| format!("get s3://{}/{key}", self.bucket))?;
+            Ok(output.body.collect().await?.into_bytes().to_vec())
+        })
+    }
+    fn put(&self, hash: &str, bytes: &[u8]) -> Result<bool> {
+        if self.exists(hash)? {
+            return Ok(false);
+        }
+        let key = self.key(hash)?;
+        self.runtime.block_on(async {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(bytes.to_vec()))
+                .send()
+                .await
+                .with_context(|| format!("put s3://{}/{key}", self.bucket))?;
+            Ok(true)
+        })
+    }
+    fn exists(&self, hash: &str) -> Result<bool> {
+        let key = self.key(hash)?;
+        self.runtime.block_on(async {
+            match self
+                .client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error)
+                    if error
+                        .raw_response()
+                        .is_some_and(|r| r.status().as_u16() == 404) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => {
+                    Err(error).with_context(|| format!("head s3://{}/{key}", self.bucket))
+                }
+            }
+        })
+    }
+}
+
+impl ObjectStore for LocalStore {
+    fn get(&self, hash: &str) -> Result<Vec<u8>> {
+        let path = self.object_path(hash)?;
+        fs::read(&path).with_context(|| format!("read object {}", path.display()))
+    }
+    fn put(&self, hash: &str, bytes: &[u8]) -> Result<bool> {
+        let path = self.object_path(hash)?;
+        if path.exists() {
+            return Ok(false);
+        }
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent)?;
+        let tmp = parent.join(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            &hash[hash.len() - 8..]
+        ));
+        fs::write(&tmp, bytes)?;
+        match fs::rename(&tmp, &path) {
+            Ok(()) => Ok(true),
+            Err(_) if path.exists() => {
+                let _ = fs::remove_file(tmp);
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    fn exists(&self, hash: &str) -> Result<bool> {
+        Ok(self.object_path(hash)?.is_file())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_keys_are_validated_and_prefixes_normalized() {
+        let hash = format!("blake3:{}", "ab".repeat(32));
+        assert_eq!(
+            object_key(&hash, "/project/assets/").unwrap(),
+            format!("project/assets/objects/ab/{}", "ab".repeat(31))
+        );
+        assert!(object_key("blake3:not-a-hash", "").is_err());
+    }
+}
