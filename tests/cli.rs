@@ -25,6 +25,27 @@ fn succeeds(output: &std::process::Output) -> bool {
     output.status.success()
 }
 
+fn git(project: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("-c")
+        .arg("user.email=arbora@example.invalid")
+        .arg("-c")
+        .arg("user.name=Arbora Test")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg(format!(
+            "core.hooksPath={}",
+            project.join(".arbora-test-hooks").display()
+        ))
+        .arg("-C")
+        .arg(project)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap()
+}
+
 fn locked_root(project: &std::path::Path) -> String {
     let lock = fs::read_to_string(project.join("assets.lock")).unwrap();
     lock.lines()
@@ -244,17 +265,10 @@ fn remote_gc_can_retain_every_lock_root_in_git_history() {
 
     for args in [
         &["init"][..],
-        &["config", "user.email", "arbora@example.invalid"],
-        &["config", "user.name", "Arbora Test"],
         &["add", ".arbora.toml", ".aboraignore", "assets.lock"],
         &["commit", "-m", "retain historical root"],
     ] {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .unwrap();
+        let output = git(project, args);
         assert!(
             output.status.success(),
             "{}",
@@ -269,12 +283,7 @@ fn remote_gc_can_retain_every_lock_root_in_git_history() {
         &["commit", "-m", "retain intermediate root"],
         &["commit", "--allow-empty", "-m", "same root, newer commit"],
     ] {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .unwrap();
+        let output = git(project, args);
         assert!(
             output.status.success(),
             "{}",
