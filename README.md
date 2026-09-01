@@ -50,7 +50,7 @@ arbora init
 
 # Add files beneath assets/, then publish them.
 arbora push
-git add .arbora.toml assets.lock
+git add .arbora.toml .aboraignore assets.lock
 
 # On another checkout:
 arbora pull
@@ -66,8 +66,8 @@ assets/            Asset workspace
 .arbora-remote/    Default local object store
 ```
 
-Commit `.arbora.toml` and `assets.lock`. Usually the following belongs in the
-project's `.gitignore`:
+Commit `.arbora.toml`, `.aboraignore`, and `assets.lock`. Usually the following
+belongs in the project's `.gitignore`:
 
 ```gitignore
 /assets/
@@ -91,6 +91,11 @@ union of every registered project root rather than treating the current project
 as the cache's sole owner. Objects created before this reference registry was
 introduced are conservatively protected during migration.
 
+Transfers are bounded and parallel: `concurrency` limits both simultaneous
+uploads during `push` and simultaneous downloads during `pull`, `diff`,
+`verify`, and `gc`. Objects are streamed through the cache, so memory use does
+not grow with the size of the largest asset.
+
 ## Commands
 
 | Command | Purpose |
@@ -102,7 +107,7 @@ introduced are conservatively protected during migration.
 | `arbora sync` | Pull a clean workspace or push a changed workspace |
 | `arbora diff` | Show added, modified, and deleted files |
 | `arbora verify` | Verify the remote object graph and workspace root |
-| `arbora gc` | Remove cache objects not reachable from this lock file |
+| `arbora gc` | Remove cache objects not referenced by any registered project |
 
 `arbora diff ROOT_A ROOT_B` compares two stored roots. With no roots it compares
 the locked root to the workspace.
@@ -111,6 +116,10 @@ Pull replaces the workspace and removes stale files by default. Use
 `arbora pull --keep-stale` to merge locked files into the existing workspace.
 `arbora sync --pull` explicitly discards local asset changes and restores the
 locked tree.
+
+Materialization automatically tries a copy-on-write reflink, then a hardlink,
+and finally a streamed copy. Mode-specific cache views preserve executable bits
+without requiring filesystem-specific setup.
 
 Use `--project PATH` with any command to operate on a project other than the
 current directory.
@@ -242,6 +251,17 @@ its parent tree, and each ancestor up to the root; unchanged subtrees retain
 their hashes.
 
 Downloaded objects are always hashed again before Arbora trusts them.
+
+## Operational notes
+
+- Uploads are immutable and idempotent; objects already present remotely are
+  skipped.
+- `assets.lock` is updated only after every required object is uploaded.
+- Pulls stage a complete replacement before updating the workspace, avoiding a
+  partially materialized asset tree.
+- Cache garbage collection is local only. Arbora never deletes remote objects.
+- Each file is currently one object, so changing part of a large file uploads
+  that entire file again.
 
 ## Development
 
