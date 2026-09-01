@@ -14,8 +14,10 @@ It is roughly **rsync for content-addressed object storage**.
 - AWS Signature V4 and the standard AWS credential provider chain
 - Verified downloads: corrupt objects are rejected before materialization
 - A global cache shared by projects and worktrees
+- Streaming hashing and transfers with memory use independent of blob size
 - File-level status and diffs without a separate revision-history system
 - Executable-bit preservation and atomic workspace replacement on pull
+- Reflink, hardlink, then streamed-copy materialization fallbacks
 
 Arbora currently stores each file as one blob. Content-defined chunking and
 remote garbage collection are intentionally out of scope for the initial
@@ -78,7 +80,16 @@ The default cache is the platform cache directory under `arbora/` (typically
 ```toml
 [cache]
 path = "/fast-disk/arbora-cache"
+
+[transfer]
+# Shared upper bound for simultaneous uploads or downloads (1-64).
+concurrency = 8
 ```
+
+The shared cache records one active root per project. `arbora gc` retains the
+union of every registered project root rather than treating the current project
+as the cache's sole owner. Objects created before this reference registry was
+introduced are conservatively protected during migration.
 
 ## Commands
 
@@ -247,3 +258,10 @@ explicitly where local sockets are available:
 ```console
 cargo test --test http_store -- --ignored
 ```
+
+CI also runs `tests/s3_compatible.rs` against a real MinIO server. The same test
+can smoke-test Cloudflare R2 from a manually dispatched GitHub Actions run when
+the `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, and
+`R2_SECRET_ACCESS_KEY` repository secrets are configured. The test exercises
+missing-object `HEAD`, streaming `PUT`, existing-object `HEAD`, and streaming
+`GET` using the production S3 adapter.

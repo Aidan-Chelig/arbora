@@ -1,8 +1,16 @@
 use std::{fs, process::Command};
 
 fn arbora(project: &std::path::Path, args: &[&str]) -> std::process::Output {
+    arbora_with_cache(project, &project.join(".test-cache"), args)
+}
+
+fn arbora_with_cache(
+    project: &std::path::Path,
+    cache: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_arbora"))
-        .env("XDG_CACHE_HOME", project.join(".test-cache"))
+        .env("XDG_CACHE_HOME", cache)
         .arg("--project")
         .arg(project)
         .args(args)
@@ -92,4 +100,62 @@ fn ignore_patterns_affect_scans_and_survive_pull() {
     assert!(!project.join("assets/stale.txt").exists());
     assert!(!project.join("assets/stale-dir").exists());
     assert!(project.join("assets/keep.tmp").exists());
+}
+
+#[test]
+fn gc_keeps_objects_referenced_by_another_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_a = temp.path().join("a");
+    let project_b = temp.path().join("b");
+    let shared_cache = temp.path().join("shared-cache");
+    fs::create_dir_all(&project_a).unwrap();
+    fs::create_dir_all(&project_b).unwrap();
+
+    for project in [&project_a, &project_b] {
+        assert!(succeeds(&arbora_with_cache(
+            project,
+            &shared_cache,
+            &["init"]
+        )));
+    }
+    fs::write(project_a.join("assets/a.txt"), b"project a, old\n").unwrap();
+    fs::write(project_b.join("assets/b.txt"), b"project b\n").unwrap();
+    assert!(succeeds(&arbora_with_cache(
+        &project_a,
+        &shared_cache,
+        &["push"]
+    )));
+    assert!(succeeds(&arbora_with_cache(
+        &project_b,
+        &shared_cache,
+        &["push"]
+    )));
+
+    // Make A's old root unreachable, then GC from A. B's remote is removed so
+    // its subsequent pull can succeed only if the shared cache retained B.
+    fs::write(project_a.join("assets/a.txt"), b"project a, new\n").unwrap();
+    assert!(succeeds(&arbora_with_cache(
+        &project_a,
+        &shared_cache,
+        &["push"]
+    )));
+    let gc = arbora_with_cache(&project_a, &shared_cache, &["gc"]);
+    assert!(succeeds(&gc));
+    assert!(
+        !String::from_utf8(gc.stdout)
+            .unwrap()
+            .starts_with("removed 0 ")
+    );
+
+    fs::remove_dir_all(project_b.join(".arbora-remote")).unwrap();
+    fs::remove_dir_all(project_b.join("assets")).unwrap();
+    assert!(succeeds(&arbora_with_cache(
+        &project_b,
+        &shared_cache,
+        &["pull"]
+    )));
+    assert_eq!(
+        fs::read(project_b.join("assets/b.txt")).unwrap(),
+        b"project b\n"
+    );
 }

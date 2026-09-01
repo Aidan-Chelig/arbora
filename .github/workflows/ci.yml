@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Select Rust toolchain
+        run: rustup override set 1.98.0
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  minio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Select Rust toolchain
+        run: rustup override set 1.98.0
+      - name: Start MinIO
+        run: >-
+          docker run --detach --name minio --publish 9000:9000
+          --env MINIO_ROOT_USER=minioadmin
+          --env MINIO_ROOT_PASSWORD=minioadmin
+          docker.io/minio/minio server /data
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs minio
+          exit 1
+      - name: Create test bucket
+        run: >-
+          docker run --rm --network host --entrypoint /bin/sh docker.io/minio/mc
+          -c 'mc alias set local http://127.0.0.1:9000 minioadmin minioadmin &&
+          mc mb --ignore-existing local/arbora-test'
+      - name: Test S3-compatible backend
+        env:
+          ARBORA_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          ARBORA_S3_TEST_BUCKET: arbora-test
+          ARBORA_S3_TEST_ACCESS_KEY: minioadmin
+          ARBORA_S3_TEST_SECRET_KEY: minioadmin
+          ARBORA_S3_TEST_REGION: us-east-1
+          ARBORA_S3_TEST_PATH_STYLE: "true"
+        run: cargo test --test s3_compatible -- --ignored
+
+  r2-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      ARBORA_S3_TEST_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      ARBORA_S3_TEST_BUCKET: ${{ secrets.R2_BUCKET }}
+      ARBORA_S3_TEST_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
+      ARBORA_S3_TEST_SECRET_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      ARBORA_S3_TEST_REGION: auto
+    steps:
+      - name: Check R2 smoke-test secrets
+        id: r2
+        run: |
+          if test -n "$ARBORA_S3_TEST_ENDPOINT" -a -n "$ARBORA_S3_TEST_BUCKET" -a -n "$ARBORA_S3_TEST_ACCESS_KEY" -a -n "$ARBORA_S3_TEST_SECRET_KEY"; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'R2 secrets are not configured; skipping the optional smoke test.'
+          fi
+      - if: steps.r2.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        if: steps.r2.outputs.enabled == 'true'
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Select Rust toolchain
+        if: steps.r2.outputs.enabled == 'true'
+        run: rustup override set 1.98.0
+      - name: Test R2 backend
+        if: steps.r2.outputs.enabled == 'true'
+        run: cargo test --test s3_compatible -- --ignored

@@ -16,6 +16,8 @@ pub struct Config {
     pub workspace: Workspace,
     #[serde(default)]
     pub cache: Cache,
+    #[serde(default)]
+    pub transfer: Transfer,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Remote {
@@ -52,6 +54,18 @@ pub struct Cache {
     pub path: Option<PathBuf>,
 }
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Transfer {
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+}
+impl Default for Transfer {
+    fn default() -> Self {
+        Self {
+            concurrency: default_concurrency(),
+        }
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Lock {
     pub version: u32,
     pub root: String,
@@ -64,6 +78,9 @@ fn default_retry_max_attempts() -> u32 {
 }
 fn default_retry_max_backoff_ms() -> u64 {
     5_000
+}
+fn default_concurrency() -> usize {
+    8
 }
 
 impl Config {
@@ -83,6 +100,13 @@ impl Config {
         Ok(dirs::cache_dir()
             .context("cannot determine cache directory")?
             .join("arbora"))
+    }
+    pub fn concurrency(&self) -> Result<usize> {
+        ensure!(
+            (1..=64).contains(&self.transfer.concurrency),
+            "transfer concurrency must be between 1 and 64"
+        );
+        Ok(self.transfer.concurrency)
     }
     pub fn ignore(&self, project: &Path) -> Result<Gitignore> {
         let path = project.join(IGNORE);

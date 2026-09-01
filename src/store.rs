@@ -5,13 +5,26 @@ use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
 use reqwest::{StatusCode, blocking::Client as HttpClient};
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
-pub trait ObjectStore {
+pub trait ObjectStore: Sync {
     fn get(&self, hash: &str) -> Result<Vec<u8>>;
     fn put(&self, hash: &str, bytes: &[u8]) -> Result<bool>;
     fn exists(&self, hash: &str) -> Result<bool>;
+    fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
+        fs::write(destination, self.get(hash)?)?;
+        Ok(())
+    }
+    fn upload_from(&self, hash: &str, source: &Path) -> Result<bool> {
+        self.put(hash, &fs::read(source)?)
+    }
+    fn put_blob_file(&self, hash: &str, source: &Path) -> Result<bool> {
+        let mut object = crate::merkle::blob_prefix().to_vec();
+        fs::File::open(source)?.read_to_end(&mut object)?;
+        self.put(hash, &object)
+    }
 }
 
 pub fn object_key(hash: &str, prefix: &str) -> Result<String> {
@@ -42,6 +55,18 @@ impl LocalStore {
     }
     pub fn object_path(&self, hash: &str) -> Result<PathBuf> {
         Ok(self.root.join(object_key(hash, "")?))
+    }
+    pub fn install_file(&self, hash: &str, source: &Path) -> Result<bool> {
+        let path = self.object_path(hash)?;
+        if path.exists() {
+            return Ok(false);
+        }
+        fs::create_dir_all(path.parent().unwrap())?;
+        match fs::rename(source, &path) {
+            Ok(()) => Ok(true),
+            Err(_) if path.exists() => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -90,6 +115,16 @@ impl ObjectStore for HttpStore {
             StatusCode::NOT_FOUND => Ok(false),
             status => bail!("HTTP HEAD failed with {status}"),
         }
+    }
+    fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
+        let mut response = self
+            .client
+            .get(self.url(hash)?)
+            .send()?
+            .error_for_status()?;
+        let mut file = fs::File::create(destination)?;
+        response.copy_to(&mut file)?;
+        Ok(())
     }
 }
 
@@ -262,6 +297,41 @@ impl ObjectStore for S3Store {
             }
         })
     }
+    fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
+        let key = self.key(hash)?;
+        self.runtime.block_on(async {
+            let output = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .with_context(|| format!("get s3://{}/{key}", self.bucket))?;
+            let mut source = output.body.into_async_read();
+            let mut destination = tokio::fs::File::create(destination).await?;
+            tokio::io::copy(&mut source, &mut destination).await?;
+            Ok(())
+        })
+    }
+    fn upload_from(&self, hash: &str, source: &Path) -> Result<bool> {
+        if self.exists(hash)? {
+            return Ok(false);
+        }
+        let key = self.key(hash)?;
+        self.runtime.block_on(async {
+            let body = ByteStream::from_path(source).await?;
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(body)
+                .send()
+                .await
+                .with_context(|| format!("put s3://{}/{key}", self.bucket))?;
+            Ok(true)
+        })
+    }
 }
 
 impl ObjectStore for LocalStore {
@@ -293,6 +363,40 @@ impl ObjectStore for LocalStore {
     }
     fn exists(&self, hash: &str) -> Result<bool> {
         Ok(self.object_path(hash)?.is_file())
+    }
+    fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
+        fs::copy(self.object_path(hash)?, destination)?;
+        Ok(())
+    }
+    fn upload_from(&self, hash: &str, source: &Path) -> Result<bool> {
+        let destination = self.object_path(hash)?;
+        if destination.exists() {
+            return Ok(false);
+        }
+        fs::create_dir_all(destination.parent().unwrap())?;
+        fs::copy(source, destination)?;
+        Ok(true)
+    }
+    fn put_blob_file(&self, hash: &str, source: &Path) -> Result<bool> {
+        let path = self.object_path(hash)?;
+        if path.exists() {
+            return Ok(false);
+        }
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".blob-{}-{}", std::process::id(), &hash[7..15]));
+        let mut output = fs::File::create(&temporary)?;
+        output.write_all(crate::merkle::blob_prefix())?;
+        std::io::copy(&mut fs::File::open(source)?, &mut output)?;
+        drop(output);
+        match fs::rename(&temporary, &path) {
+            Ok(()) => Ok(true),
+            Err(_) if path.exists() => {
+                let _ = fs::remove_file(temporary);
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

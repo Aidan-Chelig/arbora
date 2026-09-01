@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -26,6 +27,58 @@ pub type Tree = BTreeMap<String, Entry>;
 
 pub fn hash_object(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+pub fn blob_prefix() -> &'static [u8] {
+    BLOB
+}
+pub fn hash_blob_file(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BLOB);
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+pub fn verify_object_file(path: &Path, hash: &str) -> Result<()> {
+    let mut hasher = blake3::Hasher::new();
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    ensure!(
+        format!("blake3:{}", hasher.finalize().to_hex()) == hash,
+        "object {hash} failed hash verification"
+    );
+    Ok(())
+}
+pub fn verify_blob_content_file(path: &Path, hash: &str) -> Result<()> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BLOB);
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    ensure!(
+        format!("blake3:{}", hasher.finalize().to_hex()) == hash,
+        "materialized blob {hash} failed hash verification"
+    );
+    Ok(())
 }
 pub fn blob_object(content: &[u8]) -> Vec<u8> {
     let mut out = BLOB.to_vec();
@@ -178,12 +231,10 @@ fn scan_dir(
                 false,
             )
         } else if meta.is_file() {
-            let content = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            stats.bytes += content.len() as u64;
-            let object = blob_object(&content);
-            let hash = hash_object(&object);
+            stats.bytes += meta.len();
+            let hash = hash_blob_file(&path).with_context(|| format!("hash {}", path.display()))?;
             for store in stores {
-                store.put(&hash, &object)?;
+                store.put_blob_file(&hash, &path)?;
             }
             stats.blobs += 1;
             (Kind::Blob, hash, is_executable(&meta))
@@ -225,22 +276,22 @@ pub fn verify_object(store: &dyn ObjectStore, hash: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn reachable(store: &dyn ObjectStore, root: &str) -> Result<BTreeSet<String>> {
-    fn visit(s: &dyn ObjectStore, h: &str, seen: &mut BTreeSet<String>) -> Result<()> {
+    fn visit_tree(s: &dyn ObjectStore, h: &str, seen: &mut BTreeSet<String>) -> Result<()> {
         if !seen.insert(h.to_owned()) {
             return Ok(());
         }
         let b = verify_object(s, h)?;
-        if b.starts_with(TREE) {
-            for e in decode_tree(&b)?.values() {
-                visit(s, &e.hash, seen)?
+        for entry in decode_tree(&b)?.values() {
+            if entry.kind == Kind::Tree {
+                visit_tree(s, &entry.hash, seen)?;
+            } else {
+                seen.insert(entry.hash.clone());
             }
-        } else {
-            decode_blob(&b)?;
         }
         Ok(())
     }
     let mut seen = BTreeSet::new();
-    visit(store, root, &mut seen)?;
+    visit_tree(store, root, &mut seen)?;
     Ok(seen)
 }
 pub fn flatten(store: &dyn ObjectStore, root: &str) -> Result<BTreeMap<PathBuf, Entry>> {
@@ -290,5 +341,17 @@ mod tests {
         let b = encode_tree(&t).unwrap();
         assert_eq!(decode_tree(&b).unwrap(), t);
         assert_eq!(b, encode_tree(&t).unwrap());
+    }
+
+    #[test]
+    fn streamed_blob_hash_matches_canonical_object_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.bin");
+        let content = vec![0x5a; 2 * 1024 * 1024];
+        fs::write(&path, &content).unwrap();
+        assert_eq!(
+            hash_blob_file(&path).unwrap(),
+            hash_object(&blob_object(&content))
+        );
     }
 }

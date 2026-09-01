@@ -120,7 +120,13 @@ fn stores(project: &Path) -> Result<(Config, Box<dyn ObjectStore>, LocalStore)> 
         other => bail!("unsupported remote type {other:?}; expected local, http, or s3"),
     };
     let cache = LocalStore::new(c.cache()?);
+    cache::initialize_references(&cache)?;
     Ok((c, remote, cache))
+}
+fn locked_root(project: &Path, cache: &LocalStore) -> Result<String> {
+    let root = config::read_lock(project)?.root;
+    cache::register_root(cache, project, &root)?;
+    Ok(root)
 }
 fn init(project: &Path, workspace: PathBuf, remote: PathBuf, force: bool) -> Result<()> {
     fs::create_dir_all(project)?;
@@ -154,6 +160,7 @@ fn init(project: &Path, workspace: PathBuf, remote: PathBuf, force: bool) -> Res
             remove_stale: true,
         },
         cache: config::Cache::default(),
+        transfer: config::Transfer::default(),
     };
     fs::write(&path, toml::to_string_pretty(&c)?)?;
     let ignore = project.join(config::IGNORE);
@@ -175,7 +182,7 @@ fn workspace_root(project: &Path, c: &Config, cache: &LocalStore) -> Result<Stri
 fn status(project: &Path) -> Result<()> {
     let (c, _, cache) = stores(project)?;
     let current = workspace_root(project, &c, &cache)?;
-    let expected = config::read_lock(project)?.root;
+    let expected = locked_root(project, &cache)?;
     if current == expected {
         println!("clean\nroot {current}")
     } else {
@@ -187,22 +194,20 @@ fn status(project: &Path) -> Result<()> {
 fn push(project: &Path) -> Result<()> {
     let (c, remote, cache) = stores(project)?;
     let ignore = c.ignore(project)?;
-    let (root, stats) = merkle::scan_with_ignore(
-        &c.workspace(project),
-        &[&cache, remote.as_ref()],
-        Some(&ignore),
-    )?;
+    let (root, stats) = merkle::scan_with_ignore(&c.workspace(project), &[&cache], Some(&ignore))?;
+    let uploaded = cache::upload_tree(&root, &cache, remote.as_ref(), c.concurrency()?)?;
     config::write_lock(project, &root)?;
+    cache::register_root(&cache, project, &root)?;
     println!(
-        "pushed {root}\n{} blobs, {} trees, {} bytes",
-        stats.blobs, stats.trees, stats.bytes
+        "pushed {root}\n{} blobs, {} trees, {} bytes, {} objects uploaded",
+        stats.blobs, stats.trees, stats.bytes, uploaded
     );
     Ok(())
 }
 fn pull(project: &Path, keep_stale: bool) -> Result<()> {
     let (c, remote, cache) = stores(project)?;
-    let root = config::read_lock(project)?.root;
-    let fetched = cache::fetch_tree(&root, remote.as_ref(), &cache)?;
+    let root = locked_root(project, &cache)?;
+    let fetched = cache::fetch_tree(&root, remote.as_ref(), &cache, c.concurrency()?)?;
     let ignore = c.ignore(project)?;
     cache::materialize(
         &root,
@@ -216,7 +221,7 @@ fn pull(project: &Path, keep_stale: bool) -> Result<()> {
 }
 fn sync(project: &Path, discard: bool) -> Result<()> {
     let (c, _, cache) = stores(project)?;
-    let lock = config::read_lock(project)?.root;
+    let lock = locked_root(project, &cache)?;
     let current = workspace_root(project, &c, &cache)?;
     if current == lock || discard {
         pull(project, false)
@@ -226,9 +231,9 @@ fn sync(project: &Path, discard: bool) -> Result<()> {
 }
 fn verify(project: &Path) -> Result<()> {
     let (c, remote, cache) = stores(project)?;
-    let root = config::read_lock(project)?.root;
-    let remote_objects = merkle::reachable(remote.as_ref(), &root).context("verify remote")?;
-    cache::fetch_tree(&root, remote.as_ref(), &cache)?;
+    let root = locked_root(project, &cache)?;
+    cache::fetch_tree(&root, remote.as_ref(), &cache, c.concurrency()?)?;
+    let remote_objects = merkle::reachable(&cache, &root)?;
     let current = workspace_root(project, &c, &cache)?;
     if current != root {
         bail!("workspace root {current} does not match locked root {root}")
@@ -240,10 +245,10 @@ fn verify(project: &Path) -> Result<()> {
     Ok(())
 }
 fn gc(project: &Path) -> Result<()> {
-    let (_, remote, cache) = stores(project)?;
-    let root = config::read_lock(project)?.root;
-    cache::fetch_tree(&root, remote.as_ref(), &cache)?;
-    let keep = merkle::reachable(&cache, &root)?;
+    let (c, remote, cache) = stores(project)?;
+    let root = locked_root(project, &cache)?;
+    cache::fetch_tree(&root, remote.as_ref(), &cache, c.concurrency()?)?;
+    let keep = cache::referenced_objects(&cache)?;
     let (count, bytes) = cache::gc(&cache, &keep)?;
     println!(
         "removed {count} objects ({bytes} bytes); kept {}",
@@ -253,12 +258,12 @@ fn gc(project: &Path) -> Result<()> {
 }
 fn diff(project: &Path, from: Option<String>, to: Option<String>) -> Result<()> {
     let (c, remote, cache) = stores(project)?;
-    let default = config::read_lock(project)?.root;
+    let default = locked_root(project, &cache)?;
     let from = from.unwrap_or(default);
-    cache::fetch_tree(&from, remote.as_ref(), &cache)?;
+    cache::fetch_tree(&from, remote.as_ref(), &cache, c.concurrency()?)?;
     let to = match to {
         Some(h) => {
-            cache::fetch_tree(&h, remote.as_ref(), &cache)?;
+            cache::fetch_tree(&h, remote.as_ref(), &cache, c.concurrency()?)?;
             h
         }
         None => workspace_root(project, &c, &cache)?,
