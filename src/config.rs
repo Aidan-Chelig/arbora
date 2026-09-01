@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -96,6 +96,9 @@ impl Config {
     pub fn cache(&self) -> Result<PathBuf> {
         if let Some(p) = &self.cache.path {
             return Ok(p.clone());
+        }
+        if let Some(path) = env::var_os("ARBORA_CACHE_DIR").filter(|path| !path.is_empty()) {
+            return Ok(PathBuf::from(path));
         }
         Ok(dirs::cache_dir()
             .context("cannot determine cache directory")?

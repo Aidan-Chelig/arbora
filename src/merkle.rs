@@ -91,8 +91,13 @@ pub fn decode_blob(bytes: &[u8]) -> Result<&[u8]> {
 
 pub fn encode_tree(tree: &Tree) -> Result<Vec<u8>> {
     let mut out = TREE.to_vec();
+    let mut portable_names = BTreeSet::new();
     for (name, entry) in tree {
         validate_name(name)?;
+        ensure!(
+            portable_names.insert(name.to_ascii_lowercase()),
+            "tree contains names that collide on a case-insensitive filesystem: {name:?}"
+        );
         ensure!(name.len() <= u32::MAX as usize, "file name too long");
         out.extend_from_slice(&(name.len() as u32).to_be_bytes());
         out.extend_from_slice(name.as_bytes());
@@ -115,6 +120,7 @@ pub fn encode_tree(tree: &Tree) -> Result<Vec<u8>> {
 pub fn decode_tree(bytes: &[u8]) -> Result<Tree> {
     let mut input = bytes.strip_prefix(TREE).context("object is not a tree")?;
     let mut tree = Tree::new();
+    let mut portable_names = BTreeSet::new();
     while !input.is_empty() {
         ensure!(input.len() >= 4, "truncated tree object");
         let len = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
@@ -125,6 +131,10 @@ pub fn decode_tree(bytes: &[u8]) -> Result<Tree> {
             .to_owned();
         input = &input[len..];
         validate_name(&name)?;
+        ensure!(
+            portable_names.insert(name.to_ascii_lowercase()),
+            "tree contains names that collide on a case-insensitive filesystem: {name:?}"
+        );
         let kind = match input[0] {
             0 => Kind::Blob,
             1 => Kind::Tree,
@@ -155,8 +165,42 @@ pub fn decode_tree(bytes: &[u8]) -> Result<Tree> {
 
 fn validate_name(name: &str) -> Result<()> {
     ensure!(
-        !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0']),
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.ends_with(['.', ' '])
+            && !name.chars().any(|c| c.is_control()
+                || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')),
         "unsafe tree entry name: {name:?}"
+    );
+    let stem = name.split('.').next().unwrap_or(name);
+    ensure!(
+        !matches!(
+            stem.to_ascii_uppercase().as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ),
+        "tree entry name is reserved on Windows: {name:?}"
     );
     Ok(())
 }
@@ -353,5 +397,23 @@ mod tests {
             hash_blob_file(&path).unwrap(),
             hash_object(&blob_object(&content))
         );
+    }
+
+    #[test]
+    fn tree_names_are_portable_to_windows() {
+        for name in ["CON", "nul.txt", "bad:name", "trailing.", "trailing "] {
+            assert!(validate_name(name).is_err(), "accepted {name:?}");
+        }
+        for name in ["console.txt", "assets", "snowman-☃.png"] {
+            validate_name(name).unwrap();
+        }
+
+        let entry = Entry {
+            kind: Kind::Blob,
+            hash: format!("blake3:{}", "ab".repeat(32)),
+            executable: false,
+        };
+        let tree = Tree::from([("Readme".into(), entry.clone()), ("README".into(), entry)]);
+        assert!(encode_tree(&tree).is_err());
     }
 }

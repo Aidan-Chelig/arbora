@@ -18,14 +18,25 @@ It is roughly **rsync for content-addressed object storage**.
 - File-level status and diffs without a separate revision-history system
 - Executable-bit preservation and atomic workspace replacement on pull
 - Reflink, hardlink, then streamed-copy materialization fallbacks
+- Native Linux, macOS, and Windows support
 
 Arbora currently stores each file as one blob. Content-defined chunking and
 remote garbage collection are intentionally out of scope for the initial
 version.
 
+Asset names are validated for portability. Windows-reserved names and
+characters, trailing dots or spaces, and case-only sibling collisions are
+rejected on every platform so a lock file created on one operating system can
+be materialized safely on another.
+
 ## Installation
 
 Arbora requires Rust 1.98 or newer.
+
+Windows x86_64 builds are attached to each
+[GitHub release](https://github.com/Aidan-Chelig/arbora/releases). Download
+`arbora-windows-x86_64.zip`, extract `arbora.exe`, and place it somewhere on
+your `PATH`.
 
 ```console
 cargo install --git https://github.com/Aidan-Chelig/arbora
@@ -86,6 +97,9 @@ path = "/fast-disk/arbora-cache"
 concurrency = 8
 ```
 
+For temporary or automated environments, `ARBORA_CACHE_DIR` overrides the
+platform default when `[cache].path` is not configured.
+
 The shared cache records one active root per project. `arbora gc` retains the
 union of every registered project root rather than treating the current project
 as the cache's sole owner. Objects created before this reference registry was
@@ -119,7 +133,8 @@ locked tree.
 
 Materialization automatically tries a copy-on-write reflink, then a hardlink,
 and finally a streamed copy. Mode-specific cache views preserve executable bits
-without requiring filesystem-specific setup.
+on Unix without requiring filesystem-specific setup. Windows materializes the
+same content but does not have a Unix executable-bit equivalent.
 
 Use `--project PATH` with any command to operate on a project other than the
 current directory.
@@ -285,3 +300,16 @@ the `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, and
 `R2_SECRET_ACCESS_KEY` repository secrets are configured. The test exercises
 missing-object `HEAD`, streaming `PUT`, existing-object `HEAD`, and streaming
 `GET` using the production S3 adapter.
+
+## Releasing
+
+Push a version tag to build and publish a GitHub release:
+
+```console
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release pipeline currently publishes one asset,
+`arbora-windows-x86_64.zip`, containing the Windows release executable. Other
+platform artifacts can be added later without changing the release convention.

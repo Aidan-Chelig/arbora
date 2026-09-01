@@ -10,7 +10,7 @@ fn arbora_with_cache(
     args: &[&str],
 ) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_arbora"))
-        .env("XDG_CACHE_HOME", cache)
+        .env("ARBORA_CACHE_DIR", cache)
         .arg("--project")
         .arg(project)
         .args(args)

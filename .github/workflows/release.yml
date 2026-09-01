@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Select Rust toolchain
+        run: rustup override set 1.98.0
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $package = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0]
+          $expected = "v$($package.version)"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "release tag $env:GITHUB_REF_NAME does not match package version $expected"
+          }
+      - name: Build release executable
+        run: cargo build --locked --release
+      - name: Package release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist
+          Copy-Item target/release/arbora.exe dist/arbora.exe
+          Compress-Archive -Path dist/arbora.exe -DestinationPath arbora-windows-x86_64.zip
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create $env:GITHUB_REF_NAME
+          arbora-windows-x86_64.zip
+          --verify-tag
+          --generate-notes
+          --title $env:GITHUB_REF_NAME

@@ -58,10 +58,30 @@ pub fn register_root(store: &LocalStore, project: &Path, root: &str) -> Result<(
         .into_owned();
     let name = blake3::hash(identity.as_bytes()).to_hex().to_string();
     let projects = store.root().join(REFS).join(PROJECTS);
-    let path = projects.join(&name);
-    let temporary = projects.join(format!(".{name}-{}", std::process::id()));
+    let root_name = root.strip_prefix("blake3:").unwrap_or(root);
+    let reference_name = format!("{name}.{root_name}");
+    let path = projects.join(&reference_name);
+    let temporary = projects.join(format!(".{reference_name}-{}", std::process::id()));
     fs::write(&temporary, format!("{root}\n"))?;
-    fs::rename(temporary, path)?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        if path.exists() {
+            let _ = fs::remove_file(&temporary);
+        } else {
+            return Err(error.into());
+        }
+    }
+    // Install the new reference before retiring the old one. Unlike replacing
+    // a file in place, this has no missing-reference window on Windows.
+    for entry in fs::read_dir(&projects)? {
+        let entry = entry?;
+        let old_name = entry.file_name();
+        let old_name = old_name.to_string_lossy();
+        if old_name != reference_name
+            && (old_name == name || old_name.starts_with(&format!("{name}.")))
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
     Ok(())
 }
 
@@ -597,6 +617,25 @@ mod tests {
         remote.maximum.store(0, Ordering::SeqCst);
         assert_eq!(upload_tree(&root, &cache, remote.as_ref(), 2).unwrap(), 10);
         assert_eq!(remote.maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn updating_a_project_reference_replaces_the_previous_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = LocalStore::new(temp.path().join("cache"));
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+
+        register_root(&cache, &project, "first").unwrap();
+        register_root(&cache, &project, "second").unwrap();
+
+        let projects = cache.root().join(REFS).join(PROJECTS);
+        let references = fs::read_dir(projects).unwrap().collect::<Vec<_>>();
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            fs::read_to_string(references[0].as_ref().unwrap().path()).unwrap(),
+            "second\n"
+        );
     }
 
     #[test]
