@@ -1,7 +1,7 @@
 use crate::{
     cache,
     config::{self, CONFIG, Config},
-    merkle,
+    merkle, remote_gc,
     store::{HttpStore, LocalStore, ObjectStore, S3Options, S3Store},
 };
 use anyhow::{Context, Result, bail};
@@ -47,8 +47,33 @@ enum Command {
     },
     /// Verify all objects reachable from assets.lock and the workspace contents.
     Verify,
-    /// Remove cache objects not reachable from this project's lock.
-    Gc,
+    /// Remove unreferenced local-cache objects, or safely analyze a remote.
+    Gc {
+        /// Operate on the configured remote instead of the local cache.
+        #[arg(long)]
+        remote: bool,
+        /// Explicitly select the default non-destructive mode.
+        #[arg(long, conflicts_with = "confirm")]
+        dry_run: bool,
+        /// Delete the reported remote candidates.
+        #[arg(long)]
+        confirm: bool,
+        /// Preserve an additional Arbora root (repeatable).
+        #[arg(long, value_name = "ROOT")]
+        keep_root: Vec<String>,
+        /// Preserve locks from every commit reachable by any Git ref.
+        #[arg(long)]
+        roots_from_git: bool,
+        /// Preserve locks from the most recent N Git commits.
+        #[arg(long, value_name = "N")]
+        keep_last: Option<usize>,
+        /// Only collect unreferenced objects at least this old (for example 90d).
+        #[arg(long, value_name = "AGE")]
+        older_than: Option<String>,
+        /// Write the GC report to this path instead of the cache report directory.
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
+    },
     /// Show file changes against assets.lock, or between two root hashes.
     Diff {
         from: Option<String>,
@@ -70,7 +95,28 @@ pub fn run() -> Result<()> {
         Command::Pull { keep_stale } => pull(&project, keep_stale),
         Command::Sync { pull: discard } => sync(&project, discard),
         Command::Verify => verify(&project),
-        Command::Gc => gc(&project),
+        Command::Gc {
+            remote,
+            dry_run,
+            confirm,
+            keep_root,
+            roots_from_git,
+            keep_last,
+            older_than,
+            report,
+        } => gc(
+            &project,
+            RemoteGcOptions {
+                remote,
+                dry_run,
+                confirm,
+                keep_root,
+                roots_from_git,
+                keep_last,
+                older_than,
+                report,
+            },
+        ),
         Command::Diff { from, to } => diff(&project, from, to),
     }
 }
@@ -244,7 +290,22 @@ fn verify(project: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn gc(project: &Path) -> Result<()> {
+struct RemoteGcOptions {
+    remote: bool,
+    dry_run: bool,
+    confirm: bool,
+    keep_root: Vec<String>,
+    roots_from_git: bool,
+    keep_last: Option<usize>,
+    older_than: Option<String>,
+    report: Option<PathBuf>,
+}
+
+fn gc(project: &Path, options: RemoteGcOptions) -> Result<()> {
+    if options.remote {
+        return remote_gc(project, options);
+    }
+    ensure_local_gc_options(&options)?;
     let (c, remote, cache) = stores(project)?;
     let root = locked_root(project, &cache)?;
     cache::fetch_tree(&root, remote.as_ref(), &cache, c.concurrency()?)?;
@@ -255,6 +316,115 @@ fn gc(project: &Path) -> Result<()> {
         keep.len()
     );
     Ok(())
+}
+
+fn ensure_local_gc_options(options: &RemoteGcOptions) -> Result<()> {
+    if options.dry_run
+        || options.confirm
+        || !options.keep_root.is_empty()
+        || options.roots_from_git
+        || options.keep_last.is_some()
+        || options.older_than.is_some()
+        || options.report.is_some()
+    {
+        bail!("remote retention options require arbora gc --remote");
+    }
+    Ok(())
+}
+
+fn remote_gc(project: &Path, options: RemoteGcOptions) -> Result<()> {
+    let (c, remote, cache) = stores(project)?;
+    let mut roots = BTreeSet::from([locked_root(project, &cache)?]);
+    roots.extend(options.keep_root);
+    if options.roots_from_git {
+        roots.extend(remote_gc::roots_from_git(project, true, None)?);
+    }
+    if let Some(keep_last) = options.keep_last {
+        roots.extend(remote_gc::roots_from_git(project, false, Some(keep_last))?);
+    }
+    let older_than = options
+        .older_than
+        .as_deref()
+        .map(remote_gc::parse_age)
+        .transpose()?;
+    let analysis =
+        remote_gc::analyze(roots, remote.as_ref(), &cache, c.concurrency()?, older_than)?;
+    let reclaimable_bytes = analysis
+        .candidates
+        .iter()
+        .try_fold(0_u64, |total, object| total.checked_add(object.size))
+        .context("reclaimable byte count overflow")?;
+    let hashes = analysis
+        .candidates
+        .iter()
+        .map(|object| object.hash.clone())
+        .collect::<Vec<_>>();
+
+    let action = if options.confirm {
+        remote.delete_objects(&hashes)?;
+        "deleted"
+    } else {
+        "would delete"
+    };
+    let report = write_remote_gc_report(
+        options.report,
+        project,
+        &cache,
+        action,
+        &analysis,
+        reclaimable_bytes,
+    )?;
+    println!(
+        "remote GC {action} {} objects ({} bytes); retained {} roots and {} objects\nreport {}",
+        hashes.len(),
+        reclaimable_bytes,
+        analysis.retained_roots.len(),
+        analysis.retained_objects.len(),
+        report.display()
+    );
+    if !options.confirm {
+        println!("dry run; rerun with --confirm to delete these objects");
+    }
+    Ok(())
+}
+
+fn write_remote_gc_report(
+    requested: Option<PathBuf>,
+    project: &Path,
+    cache: &LocalStore,
+    action: &str,
+    analysis: &remote_gc::Analysis,
+    bytes: u64,
+) -> Result<PathBuf> {
+    let timestamp = remote_gc::unix_now()?;
+    let report_id = remote_gc::unix_now_nanos()?;
+    let path = match requested {
+        Some(path) if path.is_relative() => project.join(path),
+        Some(path) => path,
+        None => cache
+            .root()
+            .join("gc-reports")
+            .join(format!("remote-gc-{report_id}.txt")),
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut report = format!(
+        "arbora remote GC report\ntimestamp = {timestamp}\naction = {action}\nretained_roots = {}\nretained_objects = {}\ncandidate_objects = {}\ncandidate_bytes = {bytes}\n\nretained root hashes:\n",
+        analysis.retained_roots.len(),
+        analysis.retained_objects.len(),
+        analysis.candidates.len(),
+    );
+    for root in &analysis.retained_roots {
+        report.push_str(root);
+        report.push('\n');
+    }
+    report.push_str("\nobject hashes:\n");
+    for object in &analysis.candidates {
+        report.push_str(&format!("{} {}\n", object.hash, object.size));
+    }
+    fs::write(&path, report)?;
+    Ok(path)
 }
 fn diff(project: &Path, from: Option<String>, to: Option<String>) -> Result<()> {
     let (c, remote, cache) = stores(project)?;

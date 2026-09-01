@@ -127,7 +127,10 @@ pub fn read_lock(project: &Path) -> Result<Lock> {
     let path = project.join(LOCK);
     let text = fs::read_to_string(&path)
         .with_context(|| format!("read {}; run `arbora push` first", path.display()))?;
-    let lock: Lock = toml::from_str(&text)?;
+    parse_lock(&text)
+}
+pub fn parse_lock(text: &str) -> Result<Lock> {
+    let lock: Lock = toml::from_str(text)?;
     ensure!(
         lock.version == 1,
         "unsupported lock version {}",

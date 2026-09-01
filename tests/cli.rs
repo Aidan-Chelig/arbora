@@ -25,6 +25,15 @@ fn succeeds(output: &std::process::Output) -> bool {
     output.status.success()
 }
 
+fn locked_root(project: &std::path::Path) -> String {
+    let lock = fs::read_to_string(project.join("assets.lock")).unwrap();
+    lock.lines()
+        .find_map(|line| line.strip_prefix("root = \""))
+        .and_then(|line| line.strip_suffix('"'))
+        .unwrap()
+        .to_owned()
+}
+
 #[test]
 fn push_diff_pull_and_verify_round_trip() {
     let temp = tempfile::tempdir().unwrap();
@@ -157,5 +166,136 @@ fn gc_keeps_objects_referenced_by_another_project() {
     assert_eq!(
         fs::read(project_b.join("assets/b.txt")).unwrap(),
         b"project b\n"
+    );
+}
+
+#[test]
+fn remote_gc_is_dry_run_by_default_and_requires_confirmation_to_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    assert!(succeeds(&arbora(project, &["init"])));
+    fs::write(project.join("assets/data.bin"), b"old data").unwrap();
+    assert!(succeeds(&arbora(project, &["push"])));
+    let old_root = locked_root(project);
+
+    fs::write(project.join("assets/data.bin"), b"new data").unwrap();
+    assert!(succeeds(&arbora(project, &["push"])));
+
+    let protected = arbora(project, &["gc", "--remote", "--keep-root", &old_root]);
+    assert!(succeeds(&protected));
+    assert!(
+        String::from_utf8(protected.stdout)
+            .unwrap()
+            .contains("would delete 0 objects")
+    );
+
+    let dry_run = arbora(project, &["gc", "--remote"]);
+    assert!(succeeds(&dry_run));
+    assert!(
+        String::from_utf8(dry_run.stdout)
+            .unwrap()
+            .contains("would delete 2 objects")
+    );
+
+    // A second analysis sees the same objects, proving the first invocation
+    // did not mutate the remote.
+    let second_dry_run = arbora(project, &["gc", "--remote", "--dry-run"]);
+    assert!(succeeds(&second_dry_run));
+    assert!(
+        String::from_utf8(second_dry_run.stdout)
+            .unwrap()
+            .contains("would delete 2 objects")
+    );
+
+    let confirmed = arbora(project, &["gc", "--remote", "--confirm"]);
+    assert!(succeeds(&confirmed));
+    assert!(
+        String::from_utf8(confirmed.stdout)
+            .unwrap()
+            .contains("deleted 2 objects")
+    );
+    let reports = fs::read_dir(project.join(".test-cache/gc-reports"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        reports
+            .iter()
+            .any(|report| report.contains("action = deleted")
+                && report.contains("candidate_objects = 2")
+                && report.contains("blake3:"))
+    );
+    let after = arbora(project, &["gc", "--remote"]);
+    assert!(succeeds(&after));
+    assert!(
+        String::from_utf8(after.stdout)
+            .unwrap()
+            .contains("would delete 0 objects")
+    );
+}
+
+#[test]
+fn remote_gc_can_retain_every_lock_root_in_git_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    assert!(succeeds(&arbora(project, &["init"])));
+    fs::write(project.join("assets/data.bin"), b"historical").unwrap();
+    assert!(succeeds(&arbora(project, &["push"])));
+
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "arbora@example.invalid"],
+        &["config", "user.name", "Arbora Test"],
+        &["add", ".arbora.toml", ".aboraignore", "assets.lock"],
+        &["commit", "-m", "retain historical root"],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(project.join("assets/data.bin"), b"intermediate").unwrap();
+    assert!(succeeds(&arbora(project, &["push"])));
+    for args in [
+        &["add", "assets.lock"][..],
+        &["commit", "-m", "retain intermediate root"],
+        &["commit", "--allow-empty", "-m", "same root, newer commit"],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(project.join("assets/data.bin"), b"current").unwrap();
+    assert!(succeeds(&arbora(project, &["push"])));
+    let recent = arbora(project, &["gc", "--remote", "--keep-last", "2"]);
+    assert!(succeeds(&recent));
+    assert!(
+        String::from_utf8(recent.stdout)
+            .unwrap()
+            .contains("would delete 0 objects")
+    );
+    let gc = arbora(project, &["gc", "--remote", "--roots-from-git"]);
+    assert!(succeeds(&gc));
+    assert!(
+        String::from_utf8(gc.stdout)
+            .unwrap()
+            .contains("would delete 0 objects")
     );
 }

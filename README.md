@@ -20,9 +20,8 @@ It is roughly **rsync for content-addressed object storage**.
 - Reflink, hardlink, then streamed-copy materialization fallbacks
 - Native Linux, macOS, and Windows support
 
-Arbora currently stores each file as one blob. Content-defined chunking and
-remote garbage collection are intentionally out of scope for the initial
-version.
+Arbora currently stores each file as one blob. Content-defined chunking is
+intentionally out of scope for the initial version.
 
 Asset names are validated for portability. Windows-reserved names and
 characters, trailing dots or spaces, and case-only sibling collisions are
@@ -121,7 +120,7 @@ not grow with the size of the largest asset.
 | `arbora sync` | Pull a clean workspace or push a changed workspace |
 | `arbora diff` | Show added, modified, and deleted files |
 | `arbora verify` | Verify the remote object graph and workspace root |
-| `arbora gc` | Remove cache objects not referenced by any registered project |
+| `arbora gc` | Remove unreferenced cache objects, or safely analyze a remote |
 
 `arbora diff ROOT_A ROOT_B` compares two stored roots. With no roots it compares
 the locked root to the workspace.
@@ -251,6 +250,53 @@ Recommended permissions are:
 
 Arbora does not need delete permission for normal operation.
 
+Remote garbage collection additionally requires list and delete permissions.
+Use separate administrative credentials rather than granting these permissions
+to ordinary readers or publishers.
+
+## Remote garbage collection
+
+`arbora gc --remote` inventories only the `objects/` namespace beneath the
+configured remote prefix. It verifies and traverses every retained root before
+listing candidates. If any retained object is missing or corrupt, the command
+aborts without deleting anything.
+
+Remote GC is a dry run unless `--confirm` is supplied:
+
+```console
+# Preserve the current lock root and show reclaimable objects and bytes.
+arbora gc --remote
+
+# Preserve additional roots explicitly.
+arbora gc --remote \
+  --keep-root blake3:0123... \
+  --keep-root blake3:abcd...
+
+# Preserve every assets.lock root in commits reachable from branches and tags.
+arbora gc --remote --roots-from-git
+
+# Also preserve roots from the 20 most recent commits and give newly orphaned
+# objects a 90-day grace period.
+arbora gc --remote --keep-last 20 --older-than 90d
+
+# Perform deletion only after reviewing the dry-run report.
+arbora gc --remote --roots-from-git --older-than 90d --confirm
+```
+
+Age suffixes are `s`, `m`, `h`, `d`, and `w`. When `--older-than` is
+used, objects without reliable modification timestamps are preserved. S3
+deletions are sent in batches of up to 1,000 objects.
+
+Every run writes a report under the cache's `gc-reports/` directory. Use
+`--report PATH` to select another location. Reports include retained roots,
+candidate counts and bytes, and every candidate or deleted object hash.
+
+The configured prefix is the ownership boundary. If multiple projects use the
+same bucket, assign each project a distinct prefix. Arbora cannot discover lock
+roots in unrelated repositories, clones, or release systems that share a
+prefix; pass all such roots with `--keep-root` before confirming deletion.
+HTTP remotes remain read-only and cannot be garbage-collected.
+
 ## Storage layout
 
 Objects use the same layout on every backend:
@@ -274,7 +320,8 @@ Downloaded objects are always hashed again before Arbora trusts them.
 - `assets.lock` is updated only after every required object is uploaded.
 - Pulls stage a complete replacement before updating the workspace, avoiding a
   partially materialized asset tree.
-- Cache garbage collection is local only. Arbora never deletes remote objects.
+- Remote objects are deleted only by an explicitly confirmed
+  `arbora gc --remote --confirm` operation.
 - Each file is currently one object, so changing part of a large file uploads
   that entire file again.
 

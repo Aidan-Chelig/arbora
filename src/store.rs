@@ -1,18 +1,36 @@
 use anyhow::{Context, Result, bail, ensure};
 use aws_config::retry::RetryConfig;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client as S3Client,
+    primitives::ByteStream,
+    types::{Delete, ObjectIdentifier},
+};
 use reqwest::{StatusCode, blocking::Client as HttpClient};
 use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectInfo {
+    pub hash: String,
+    pub size: u64,
+    pub modified_unix_seconds: Option<i64>,
+}
 
 pub trait ObjectStore: Sync {
     fn get(&self, hash: &str) -> Result<Vec<u8>>;
     fn put(&self, hash: &str, bytes: &[u8]) -> Result<bool>;
     fn exists(&self, hash: &str) -> Result<bool>;
+    fn list_objects(&self) -> Result<Vec<ObjectInfo>> {
+        bail!("this remote does not support object listing")
+    }
+    fn delete_objects(&self, _hashes: &[String]) -> Result<()> {
+        bail!("this remote does not support object deletion")
+    }
     fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
         fs::write(destination, self.get(hash)?)?;
         Ok(())
@@ -25,6 +43,26 @@ pub trait ObjectStore: Sync {
         fs::File::open(source)?.read_to_end(&mut object)?;
         self.put(hash, &object)
     }
+}
+
+fn objects_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        "objects/".into()
+    } else {
+        format!("{prefix}/objects/")
+    }
+}
+
+fn hash_from_key(key: &str, prefix: &str) -> Option<String> {
+    let relative = key.strip_prefix(&objects_prefix(prefix))?;
+    let (first, rest) = relative.split_once('/')?;
+    let hex = format!("{first}{rest}");
+    (first.len() == 2
+        && rest.len() == 62
+        && !rest.contains('/')
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| format!("blake3:{hex}"))
 }
 
 pub fn object_key(hash: &str, prefix: &str) -> Result<String> {
@@ -297,6 +335,79 @@ impl ObjectStore for S3Store {
             }
         })
     }
+    fn list_objects(&self) -> Result<Vec<ObjectInfo>> {
+        let prefix = objects_prefix(&self.prefix);
+        self.runtime.block_on(async {
+            let mut continuation = None;
+            let mut objects = Vec::new();
+            loop {
+                let output = self
+                    .client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&prefix)
+                    .set_continuation_token(continuation)
+                    .send()
+                    .await
+                    .with_context(|| format!("list s3://{}/{prefix}", self.bucket))?;
+                for object in output.contents() {
+                    let Some(key) = object.key() else { continue };
+                    let Some(hash) = hash_from_key(key, &self.prefix) else {
+                        continue;
+                    };
+                    let size = u64::try_from(object.size().unwrap_or_default())
+                        .context("S3 returned a negative object size")?;
+                    let modified_unix_seconds = object
+                        .last_modified()
+                        .map(|timestamp| timestamp.as_secs_f64().floor() as i64);
+                    objects.push(ObjectInfo {
+                        hash,
+                        size,
+                        modified_unix_seconds,
+                    });
+                }
+                if output.is_truncated() != Some(true) {
+                    break;
+                }
+                continuation = Some(
+                    output
+                        .next_continuation_token()
+                        .context("S3 truncated listing omitted continuation token")?
+                        .to_owned(),
+                );
+            }
+            Ok(objects)
+        })
+    }
+    fn delete_objects(&self, hashes: &[String]) -> Result<()> {
+        self.runtime.block_on(async {
+            for batch in hashes.chunks(1_000) {
+                let objects = batch
+                    .iter()
+                    .map(|hash| Ok(ObjectIdentifier::builder().key(self.key(hash)?).build()?))
+                    .collect::<Result<Vec<_>>>()?;
+                let delete = Delete::builder()
+                    .set_objects(Some(objects))
+                    .quiet(true)
+                    .build()?;
+                let output = self
+                    .client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .with_context(|| format!("delete objects from s3://{}", self.bucket))?;
+                ensure!(
+                    output.errors().is_empty(),
+                    "S3 failed to delete {} object(s): {:?}",
+                    output.errors().len(),
+                    output.errors()
+                );
+            }
+            Ok(())
+        })
+    }
     fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
         let key = self.key(hash)?;
         self.runtime.block_on(async {
@@ -364,6 +475,50 @@ impl ObjectStore for LocalStore {
     fn exists(&self, hash: &str) -> Result<bool> {
         Ok(self.object_path(hash)?.is_file())
     }
+    fn list_objects(&self) -> Result<Vec<ObjectInfo>> {
+        let base = self.root.join("objects");
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+        let mut objects = Vec::new();
+        for entry in walkdir::WalkDir::new(&base).min_depth(2).max_depth(2) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(&self.root)?;
+            let key = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let Some(hash) = hash_from_key(&key, "") else {
+                continue;
+            };
+            let metadata = entry.metadata()?;
+            let modified_unix_seconds = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+            objects.push(ObjectInfo {
+                hash,
+                size: metadata.len(),
+                modified_unix_seconds,
+            });
+        }
+        objects.sort_by(|left, right| left.hash.cmp(&right.hash));
+        Ok(objects)
+    }
+    fn delete_objects(&self, hashes: &[String]) -> Result<()> {
+        for hash in hashes {
+            let path = self.object_path(hash)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
     fn download_to(&self, hash: &str, destination: &Path) -> Result<()> {
         fs::copy(self.object_path(hash)?, destination)?;
         Ok(())
@@ -412,5 +567,13 @@ mod tests {
             format!("project/assets/objects/ab/{}", "ab".repeat(31))
         );
         assert!(object_key("blake3:not-a-hash", "").is_err());
+        assert_eq!(
+            hash_from_key(
+                &format!("project/objects/ab/{}", "cd".repeat(31)),
+                "project"
+            ),
+            Some(format!("blake3:ab{}", "cd".repeat(31)))
+        );
+        assert!(hash_from_key("other/objects/ab/deadbeef", "project").is_none());
     }
 }

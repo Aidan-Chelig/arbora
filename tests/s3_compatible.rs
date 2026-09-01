@@ -37,5 +37,9 @@ fn put_head_get_round_trip() -> Result<()> {
     assert!(!store.upload_from(&hash, &source)?);
     store.download_to(&hash, &destination)?;
     assert_eq!(fs::read(destination)?, object);
+    let listed = store.list_objects()?;
+    assert!(listed.iter().any(|item| item.hash == hash && item.size > 0));
+    store.delete_objects(std::slice::from_ref(&hash))?;
+    assert!(!store.exists(&hash)?);
     Ok(())
 }

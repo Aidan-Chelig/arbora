@@ -14,6 +14,9 @@ local, HTTP, S3, cache, lock-file, and ignore-file implementation.
       portable fallback.
 - [x] Exercise the S3 backend against an actual S3-compatible service in CI,
       with an optional R2 smoke-test path.
+- [x] Add prefix-scoped remote garbage collection with dry-run reports,
+      explicit confirmation, Git-history and manual root retention, grace
+      periods, and batched S3 deletion.
 
 Each item is checked only after its implementation, regression tests, strict
 lint, and relevant integration tests pass.
